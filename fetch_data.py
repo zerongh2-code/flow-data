@@ -136,7 +136,8 @@ WHERE THE MONEY IS FLOWING — infer capital flow direction from the prices, cha
 ⚠ NEEDS YOUR ATTENTION — 2-4 short lines, most important first: specific assets with a concrete reason and a level or event to watch. Actionable and specific, never generic.
 
 Be quantitative; cite the numbers given. Plain text, section labels in caps exactly as above, no markdown.
-End with the single line: "Automated analysis — not investment advice.""""
+End with the single line: "Automated analysis — not investment advice."
+"""
 
 LANG_LINES = {
     "en": "",
