@@ -62,15 +62,22 @@ def fetch_quotes():
     batches = [SYMBOLS[i:i + 8] for i in range(0, len(SYMBOLS), 8)]
     for bi, batch in enumerate(batches):
         url = f"https://api.twelvedata.com/quote?symbol={','.join(batch)}&apikey={TD_KEY}"
-        try:
-            j = jget(url)
-        except Exception as e:
-            print(f"batch {bi} failed: {e}")
-            time.sleep(61)
-            continue
-        if j.get("code") == 429:
-            print(f"batch {bi}: rate limited, waiting")
-            time.sleep(65)
+        j = None
+        for attempt in range(3):   # retry the SAME batch on rate limit — never skip it
+            try:
+                j = jget(url)
+            except Exception as e:
+                print(f"batch {bi} attempt {attempt}: {e}")
+                time.sleep(61)
+                continue
+            if j.get("code") == 429:
+                print(f"batch {bi} attempt {attempt}: rate limited, retrying")
+                j = None
+                time.sleep(65)
+                continue
+            break
+        if j is None:
+            print(f"batch {bi}: gave up after retries")
             continue
         m = {j["symbol"]: j} if j.get("symbol") else j
         ok = 0
