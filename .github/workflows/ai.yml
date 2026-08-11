@@ -19,6 +19,7 @@ jobs:
       - name: Generate briefs
         env:
           TWELVEDATA_KEY: ${{ secrets.TWELVEDATA_KEY }}
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           RUN_AI: "1"
         run: python3 fetch_data.py
