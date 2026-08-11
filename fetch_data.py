@@ -1,69 +1,119 @@
 #!/usr/bin/env python3
-"""FLOW cloud data engine.
+"""FLOW cloud data engine v2.
 
-Runs on a GitHub Actions schedule. Fetches US stock/ETF quotes from Twelve
-Data (key in repo secrets, never in any browser) and writes market.json;
-optionally (RUN_AI=1 + ANTHROPIC_API_KEY) generates the AI market brief in
-three languages and writes ai.json. Both files are served publicly by GitHub
-Pages and consumed by the FLOW terminal as its keyless data source.
+Publishes market.json (quotes), sp500.json (S&P 500 constituents) and ai.json
+(AI briefs) via GitHub Pages for the FLOW terminal.
+
+Quote sources, in order of preference:
+  FINNHUB_KEY   - 60 req/min free: sweeps the FULL universe (core + S&P 500,
+                  ~560 symbols) every run. Designed for a 30-min cron.
+  TWELVEDATA_KEY- 8 credits/min, 800/day free: strictly budget-gated. Runs at
+                  most every 2h, 64 credits per run: priority symbols plus a
+                  rotating window over the rest of the universe.
 """
-import json, os, sys, time, urllib.request, urllib.error
+import csv, io, json, os, time, urllib.request, urllib.parse
 from datetime import datetime, timezone
 
+FH_KEY = os.environ.get("FINNHUB_KEY", "")
 TD_KEY = os.environ.get("TWELVEDATA_KEY", "")
 AI_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 RUN_AI = os.environ.get("RUN_AI", "") == "1"
 
-SYMBOLS = [
-    # priority
+CORE = [
     "AAPL", "NVDA", "MSFT", "TSLA", "META", "AMZN", "GOOGL", "SPY",
-    # core US
     "AVGO", "TSM", "LLY", "JPM", "V", "XOM", "AMD", "PLTR", "ORCL", "CRWD",
     "NFLX", "UNH", "CAT", "GE", "VRT", "SMCI", "MU", "ASML", "COIN", "NEE",
     "CEG", "ARM",
-    # China ADRs
     "BABA", "PDD", "TCEHY", "JD", "BIDU", "NTES", "NIO", "LI", "XPEV",
-    # ETFs
     "QQQ", "VOO", "IWM", "SMH", "IBIT", "ETHA", "GLD", "TLT", "EEM", "XLE",
     "XLF", "ARKK", "URA", "BOTZ", "JEPI", "KWEB", "FXI", "MCHI", "ASHR",
 ]
+CONSTITUENTS_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
 
 
 def jget(url, timeout=25):
-    req = urllib.request.Request(url, headers={"User-Agent": "flow-data/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "flow-data/2.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 
+def load_prev(path):
+    if os.path.exists(path):
+        try:
+            return json.load(open(path))
+        except Exception:
+            pass
+    return {}
+
+
 def et_market_window():
-    """True during US pre-market through after-hours (Mon-Fri ~08:00-21:00 ET)."""
     now = datetime.now(timezone.utc)
-    # ET is UTC-4 (EDT) or UTC-5 (EST); use a generous UTC window covering both
     if now.weekday() >= 5:
         return False
     h = now.hour
-    return 12 <= h or h < 2  # 12:00 UTC ≈ 08:00 EDT → 01:59 UTC ≈ 21:59 EST
+    return 12 <= h or h < 2
 
 
-def fetch_quotes():
-    prev = {}
-    if os.path.exists("market.json"):
+def fetch_sp500():
+    """Refresh constituent list (daily is plenty)."""
+    prev = load_prev("sp500.json")
+    if prev.get("updated") and time.time() * 1000 - prev["updated"] < 20 * 3600e3:
+        return [x["s"] for x in prev.get("list", [])]
+    try:
+        req = urllib.request.Request(CONSTITUENTS_URL, headers={"User-Agent": "flow-data/2.0"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            rows = list(csv.DictReader(io.StringIO(r.read().decode())))
+        lst = [{"s": x["Symbol"].strip(), "n": x["Security"].strip(), "sec": x["GICS Sector"].strip()}
+               for x in rows if x.get("Symbol")]
+        if len(lst) > 400:
+            json.dump({"updated": int(time.time() * 1000), "list": lst}, open("sp500.json", "w"), separators=(",", ":"))
+            print(f"sp500.json refreshed: {len(lst)} constituents")
+        return [x["s"] for x in lst]
+    except Exception as e:
+        print("constituents fetch failed:", e)
+        return [x["s"] for x in prev.get("list", [])]
+
+
+def fetch_finnhub(universe, quotes):
+    ok = fail = 0
+    for i, sym in enumerate(universe):
         try:
-            prev = json.load(open("market.json")).get("quotes", {})
-        except Exception:
-            pass
-    if not TD_KEY:
-        print("no TWELVEDATA_KEY — skipping stock fetch")
-        return prev, False
-    if not et_market_window() and prev:
-        print("outside market window — keeping previous quotes")
-        return prev, False
-    quotes = dict(prev)
-    batches = [SYMBOLS[i:i + 8] for i in range(0, len(SYMBOLS), 8)]
+            q = jget(f"https://finnhub.io/api/v1/quote?symbol={urllib.parse.quote(sym)}&token={FH_KEY}", timeout=15)
+            if q.get("c"):
+                dp = q.get("dp")
+                quotes[sym] = {"c": q["c"], "pc": q.get("pc", 0), "dp": dp if dp is not None else 0,
+                               "h": q.get("h", 0), "l": q.get("l", 0), "t": q.get("t", 0)}
+                ok += 1
+            else:
+                fail += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 3:
+                print(f"  {sym}: {e}")
+            if "429" in str(e):
+                time.sleep(30)
+        time.sleep(1.05)  # 60/min ceiling
+        if i and i % 100 == 0:
+            print(f"  ...{i}/{len(universe)} ({ok} ok)")
+    print(f"finnhub sweep: {ok} ok, {fail} failed")
+    return ok
+
+
+def fetch_twelvedata(universe, quotes, prev):
+    # hard budget gate: at most one fetch per ~2h -> <= 768 credits/day
+    if prev.get("src") == "twelvedata" and time.time() * 1000 - prev.get("updated", 0) < 110 * 60e3:
+        print("TD budget gate: last fetch <110 min ago — skipping")
+        return -1
+    rot = prev.get("rot", 0)
+    rest = [s for s in universe if s not in CORE[:8] and "." not in s]
+    window = [rest[(rot + i) % len(rest)] for i in range(56)] if rest else []
+    todo = CORE[:8] + window
+    batches = [todo[i:i + 8] for i in range(0, len(todo), 8)]
+    ok = 0
     for bi, batch in enumerate(batches):
         url = f"https://api.twelvedata.com/quote?symbol={','.join(batch)}&apikey={TD_KEY}"
         j = None
-        for attempt in range(3):   # retry the SAME batch on rate limit — never skip it
+        for attempt in range(3):
             try:
                 j = jget(url)
             except Exception as e:
@@ -71,44 +121,38 @@ def fetch_quotes():
                 time.sleep(61)
                 continue
             if j.get("code") == 429:
-                print(f"batch {bi} attempt {attempt}: rate limited, retrying")
                 j = None
                 time.sleep(65)
                 continue
+            if j.get("code") == 401:
+                print("TD key invalid (401) — aborting TD fetch")
+                return 0
             break
         if j is None:
-            print(f"batch {bi}: gave up after retries")
             continue
         m = {j["symbol"]: j} if j.get("symbol") else j
-        ok = 0
         for s in batch:
             o = m.get(s, {})
             if o.get("close"):
-                quotes[s] = {
-                    "c": float(o["close"]), "pc": float(o["previous_close"]),
-                    "dp": float(o.get("percent_change") or 0),
-                    "h": float(o.get("high") or 0), "l": float(o.get("low") or 0),
-                    "t": int(o.get("timestamp") or 0),
-                    "open": o.get("is_market_open", False),
-                }
+                quotes[s] = {"c": float(o["close"]), "pc": float(o["previous_close"]),
+                             "dp": float(o.get("percent_change") or 0),
+                             "h": float(o.get("high") or 0), "l": float(o.get("low") or 0),
+                             "t": int(o.get("timestamp") or 0)}
                 ok += 1
-            else:
-                print(f"  {s}: {o.get('code')} {str(o.get('message'))[:60]}")
-        print(f"batch {bi + 1}/{len(batches)}: {ok}/{len(batch)} quotes")
         if bi < len(batches) - 1:
             time.sleep(61)
-    return quotes, True
+    prev["rot"] = (rot + 56) % max(len(rest), 1)
+    print(f"twelvedata rotation: {ok} quotes, next rot={prev['rot']}")
+    return ok
 
 
 def crypto_snapshot():
-    """Keyless context for the AI brief."""
     out = {}
     try:
         ids = "bitcoin,ethereum,solana,binancecoin,ripple,pax-gold"
         rows = jget(f"https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids={ids}&price_change_percentage=24h")
-        out["crypto"] = [
-            {"sym": r["symbol"].upper(), "px": r["current_price"], "chg": r.get("price_change_percentage_24h") or 0}
-            for r in rows]
+        out["crypto"] = [{"sym": r["symbol"].upper(), "px": r["current_price"],
+                          "chg": r.get("price_change_percentage_24h") or 0} for r in rows]
     except Exception as e:
         print("coingecko failed:", e)
     try:
@@ -125,10 +169,10 @@ def crypto_snapshot():
         print("fng failed:", e)
     try:
         heads = []
-        for q in ["crypto", "AI", "stock market"]:
-            j = jget(f"https://hn.algolia.com/api/v1/search_by_date?query={urllib.request.quote(q)}&tags=story&hitsPerPage=4")
+        for q in ["crypto", "AI", "stock market", "Federal Reserve"]:
+            j = jget(f"https://hn.algolia.com/api/v1/search_by_date?query={urllib.parse.quote(q)}&tags=story&hitsPerPage=4")
             heads += [h["title"] for h in j.get("hits", []) if h.get("title")]
-        out["news"] = heads[:10]
+        out["news"] = heads[:12]
     except Exception as e:
         print("news failed:", e)
     return out
@@ -152,13 +196,14 @@ End with the single line: "Automated analysis — not investment advice."
 
 LANG_LINES = {
     "en": "",
-    "zh-Hant": "\n\nIMPORTANT: Write all content in Traditional Chinese (繁體中文, as used in Hong Kong). Keep only the four section labels exactly in English capitals as specified above.",
-    "zh-Hans": "\n\nIMPORTANT: Write all content in Simplified Chinese (简体中文). Keep only the four section labels exactly in English capitals as specified above.",
+    "zh-Hant": "\n\nIMPORTANT: Write all content in Traditional Chinese (as used in Hong Kong). Keep only the section labels exactly in English capitals as specified above.",
+    "zh-Hans": "\n\nIMPORTANT: Write all content in Simplified Chinese. Keep only the section labels exactly in English capitals as specified above.",
 }
 
 
 def build_ai_snapshot(quotes, ctx):
-    L = [f"Snapshot time: {datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M UTC')}"]
+    now = datetime.now(timezone.utc)
+    L = [f"Snapshot time: {now.strftime('%a, %d %b %Y %H:%M UTC')} (HKT = UTC+8)"]
     if ctx.get("crypto"):
         L.append("\n== CRYPTO (live) ==")
         for c in ctx["crypto"]:
@@ -171,9 +216,9 @@ def build_ai_snapshot(quotes, ctx):
         L.append(f"Total crypto mcap ${g['mcapT']:.2f}T ({g['chg']:+.1f}% 24h), BTC dominance {g['btcDom']:.1f}%")
     live = [(s, q) for s, q in quotes.items() if q.get("c")]
     if live:
-        L.append(f"\n== US STOCKS & ETFS ({len(live)} live quotes) ==")
-        for s, q in sorted(live, key=lambda x: -abs(x[1]["dp"]))[:14]:
-            L.append(f"{s} ${q['c']:,} ({q['dp']:+.2f}%)")
+        L.append(f"\n== US STOCKS & ETFS ({len(live)} quotes) ==")
+        for s, q in sorted(live, key=lambda x: -abs(x[1].get("dp", 0)))[:16]:
+            L.append(f"{s} ${q['c']:,} ({q.get('dp', 0):+.2f}%)")
     if ctx.get("news"):
         L.append("\n== HEADLINES (real, recent) ==")
         for h in ctx["news"]:
@@ -182,15 +227,11 @@ def build_ai_snapshot(quotes, ctx):
 
 
 def anthropic_call(system, user):
-    body = json.dumps({
-        "model": "claude-opus-5", "max_tokens": 2048,
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages", data=body, method="POST",
-        headers={"content-type": "application/json", "x-api-key": AI_KEY,
-                 "anthropic-version": "2023-06-01"})
+    body = json.dumps({"model": "claude-opus-5", "max_tokens": 2048, "system": system,
+                       "messages": [{"role": "user", "content": user}]}).encode()
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, method="POST",
+                                 headers={"content-type": "application/json", "x-api-key": AI_KEY,
+                                          "anthropic-version": "2023-06-01"})
     with urllib.request.urlopen(req, timeout=300) as r:
         j = json.loads(r.read().decode())
     if j.get("stop_reason") == "refusal":
@@ -199,14 +240,32 @@ def anthropic_call(system, user):
 
 
 def main():
-    quotes, fetched = fetch_quotes()
-    market = {
-        "updated": int(time.time() * 1000),
-        "fetched_fresh": fetched,
-        "quotes": quotes,
-    }
+    sp500 = fetch_sp500()
+    universe = CORE + [s for s in sp500 if s not in CORE]
+    prev = load_prev("market.json")
+    quotes = dict(prev.get("quotes", {}))
+
+    fetched = 0
+    if not et_market_window() and quotes:
+        print("outside market window — keeping previous quotes")
+    elif FH_KEY:
+        fetched = fetch_finnhub(universe, quotes)
+        prev["src"] = "finnhub"
+    elif TD_KEY:
+        r = fetch_twelvedata(universe, quotes, prev)
+        if r >= 0:
+            fetched = r
+            prev["src"] = "twelvedata"
+        else:
+            print("budget-gated: no fetch this run")
+            return  # leave files untouched
+    else:
+        print("no quote API key configured")
+
+    market = {"updated": int(time.time() * 1000), "src": prev.get("src", ""),
+              "rot": prev.get("rot", 0), "quotes": quotes}
     json.dump(market, open("market.json", "w"), separators=(",", ":"))
-    print(f"market.json written: {len(quotes)} symbols, fresh={fetched}")
+    print(f"market.json: {len(quotes)} symbols (fetched {fetched} this run, src={market['src']})")
 
     if RUN_AI and AI_KEY:
         ctx = crypto_snapshot()
@@ -222,7 +281,7 @@ def main():
             json.dump(out, open("ai.json", "w"))
             print("ai.json written")
     elif RUN_AI:
-        print("RUN_AI set but no ANTHROPIC_API_KEY secret — skipping AI briefs")
+        print("RUN_AI set but no ANTHROPIC_API_KEY secret — skipping")
 
 
 if __name__ == "__main__":
