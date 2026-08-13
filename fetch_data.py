@@ -74,6 +74,42 @@ def fetch_sp500():
         return [x["s"] for x in prev.get("list", [])]
 
 
+
+def load_custom_symbols():
+    """User-editable ticker list + name resolution → custom.json."""
+    syms = []
+    if os.path.exists("custom_symbols.txt"):
+        for line in open("custom_symbols.txt"):
+            t = line.strip().upper()
+            if t and not t.startswith("#") and len(t) <= 8:
+                syms.append(t)
+    prev = load_prev("custom.json")
+    known = {x["s"]: x for x in prev.get("list", [])}
+    out = []
+    changed = False
+    for sym in syms:
+        if sym in known:
+            out.append(known[sym])
+            continue
+        name = sym
+        try:
+            req = urllib.request.Request(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym.replace('.', '-'))}?interval=1d&range=1d",
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh) flow-data/2.1"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                m = json.loads(r.read().decode())["chart"]["result"][0]["meta"]
+            name = m.get("longName") or m.get("shortName") or sym
+            time.sleep(1)
+        except Exception as e:
+            print(f"custom {sym}: name lookup failed ({e}) — using ticker as name")
+        out.append({"s": sym, "n": name, "sec": "Custom"})
+        changed = True
+    if changed or len(out) != len(known):
+        json.dump({"updated": int(time.time() * 1000), "list": out}, open("custom.json", "w"), separators=(",", ":"))
+        print(f"custom.json: {len(out)} custom symbols")
+    return [x["s"] for x in out]
+
+
 def fetch_finnhub(universe, quotes):
     ok = fail = 0
     for i, sym in enumerate(universe):
@@ -280,7 +316,8 @@ def anthropic_call(system, user):
 
 def main():
     sp500 = fetch_sp500()
-    universe = CORE + [s for s in sp500 if s not in CORE]
+    custom = load_custom_symbols()
+    universe = CORE + [s for s in sp500 if s not in CORE] + [s for s in custom if s not in CORE and s not in sp500]
     prev = load_prev("market.json")
     quotes = dict(prev.get("quotes", {}))
 
