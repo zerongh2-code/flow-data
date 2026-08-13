@@ -99,6 +99,45 @@ def fetch_finnhub(universe, quotes):
     return ok
 
 
+
+def fetch_yahoo(universe, quotes):
+    """Keyless fallback: Yahoo spark endpoint, 20 symbols per call."""
+    ok = 0
+    chunks = [universe[i:i + 20] for i in range(0, len(universe), 20)]
+    for ci, chunk in enumerate(chunks):
+        ysyms = ",".join(sym.replace(".", "-") for sym in chunk)
+        url = f"https://query1.finance.yahoo.com/v8/finance/spark?symbols={urllib.parse.quote(ysyms)}&range=1d&interval=1d"
+        j = None
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh) flow-data/2.1"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    j = json.loads(r.read().decode())
+                break
+            except Exception as e:
+                print(f"yahoo chunk {ci} attempt {attempt}: {e}")
+                time.sleep(20)
+        if not j:
+            continue
+        for sym in chunk:
+            d = j.get(sym.replace(".", "-"))
+            if not d:
+                continue
+            closes = [c for c in (d.get("close") or []) if c is not None]
+            pc = d.get("chartPreviousClose")
+            ts = (d.get("timestamp") or [0])[-1]
+            if closes and pc:
+                c = closes[-1]
+                quotes[sym] = {"c": round(c, 4), "pc": pc, "dp": round((c / pc - 1) * 100, 3),
+                               "h": 0, "l": 0, "t": ts}
+                ok += 1
+        time.sleep(1.5)
+        if ci and ci % 10 == 0:
+            print(f"  yahoo ...{ci}/{len(chunks)} chunks ({ok} ok)")
+    print(f"yahoo sweep: {ok} quotes from {len(chunks)} calls")
+    return ok
+
+
 def fetch_twelvedata(universe, quotes, prev):
     # hard budget gate: at most one fetch per ~2h -> <= 768 credits/day
     if prev.get("src") == "twelvedata" and time.time() * 1000 - prev.get("updated", 0) < 110 * 60e3:
@@ -251,16 +290,21 @@ def main():
     elif FH_KEY:
         fetched = fetch_finnhub(universe, quotes)
         prev["src"] = "finnhub"
-    elif TD_KEY:
-        r = fetch_twelvedata(universe, quotes, prev)
-        if r >= 0:
-            fetched = r
-            prev["src"] = "twelvedata"
-        else:
-            print("budget-gated: no fetch this run")
-            return  # leave files untouched
     else:
-        print("no quote API key configured")
+        # keyless fallback first (Yahoo), then Twelve Data if a key exists
+        fetched = fetch_yahoo(universe, quotes)
+        if fetched > 0:
+            prev["src"] = "yahoo"
+        elif TD_KEY:
+            r = fetch_twelvedata(universe, quotes, prev)
+            if r >= 0:
+                fetched = r
+                prev["src"] = "twelvedata"
+            else:
+                print("budget-gated: no fetch this run")
+                return
+        else:
+            print("no quote source available this run")
 
     market = {"updated": int(time.time() * 1000), "src": prev.get("src", ""),
               "rot": prev.get("rot", 0), "quotes": quotes}
