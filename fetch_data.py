@@ -285,8 +285,10 @@ def main():
     quotes = dict(prev.get("quotes", {}))
 
     fetched = 0
-    if not et_market_window() and quotes:
-        print("outside market window — keeping previous quotes")
+    # outside US market hours, skip only if we already hold full coverage —
+    # last-close data for the whole universe matters to Asia-hours readers
+    if not et_market_window() and len(quotes) >= 400:
+        print("outside market window with full coverage — keeping previous quotes")
     elif FH_KEY:
         fetched = fetch_finnhub(universe, quotes)
         prev["src"] = "finnhub"
