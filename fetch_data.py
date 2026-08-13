@@ -221,6 +221,60 @@ def fetch_twelvedata(universe, quotes, prev):
     return ok
 
 
+
+def yahoo_req(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh) flow-data/2.1"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return json.loads(r.read().decode())
+
+
+def fetch_history(universe):
+    """Daily price history: 6mo closes for everything, 3mo OHLC+volume for CORE.
+    Refreshed at most once per 20h."""
+    prev = load_prev("history.json")
+    if prev.get("updated") and time.time() * 1000 - prev["updated"] < 20 * 3600e3:
+        print("history fresh — skipping")
+        return
+    spark = {}
+    chunks = [universe[i:i + 20] for i in range(0, len(universe), 20)]
+    for ci, chunk in enumerate(chunks):
+        ysyms = ",".join(x.replace(".", "-") for x in chunk)
+        try:
+            j = yahoo_req(f"https://query1.finance.yahoo.com/v8/finance/spark?symbols={urllib.parse.quote(ysyms)}&range=6mo&interval=1d")
+        except Exception as e:
+            print(f"hist chunk {ci}: {e}")
+            time.sleep(10)
+            continue
+        for sym in chunk:
+            d = j.get(sym.replace(".", "-"))
+            if d and d.get("close"):
+                pts = [(t, c) for t, c in zip(d.get("timestamp") or [], d["close"]) if c is not None]
+                if len(pts) >= 5:
+                    spark[sym] = {"t": [p[0] for p in pts], "c": [round(p[1], 4) for p in pts]}
+        time.sleep(1.5)
+    ohlc = {}
+    for sym in CORE:
+        try:
+            j = yahoo_req(f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym.replace('.', '-'))}?range=3mo&interval=1d")
+            res = j["chart"]["result"][0]
+            ts = res.get("timestamp") or []
+            q = res["indicators"]["quote"][0]
+            rows = [(t, o, hh, ll, c, v or 0) for t, o, hh, ll, c, v in
+                    zip(ts, q["open"], q["high"], q["low"], q["close"], q.get("volume") or [0] * len(ts))
+                    if None not in (o, hh, ll, c)]
+            if len(rows) >= 5:
+                ohlc[sym] = {"t": [r[0] for r in rows],
+                             "o": [round(r[1], 4) for r in rows], "h": [round(r[2], 4) for r in rows],
+                             "l": [round(r[3], 4) for r in rows], "c": [round(r[4], 4) for r in rows],
+                             "v": [r[5] for r in rows]}
+        except Exception as e:
+            print(f"ohlc {sym}: {e}")
+        time.sleep(1.2)
+    json.dump({"updated": int(time.time() * 1000), "spark": spark, "ohlc": ohlc},
+              open("history.json", "w"), separators=(",", ":"))
+    print(f"history.json: {len(spark)} line series, {len(ohlc)} OHLC series")
+
+
 def crypto_snapshot():
     out = {}
     try:
@@ -349,6 +403,11 @@ def main():
               "rot": prev.get("rot", 0), "quotes": quotes}
     json.dump(market, open("market.json", "w"), separators=(",", ":"))
     print(f"market.json: {len(quotes)} symbols (fetched {fetched} this run, src={market['src']})")
+
+    try:
+        fetch_history(universe)
+    except Exception as e:
+        print("history fetch failed:", e)
 
     if RUN_AI and AI_KEY:
         ctx = crypto_snapshot()
