@@ -1,0 +1,4 @@
+# FLOW custom symbols — one US ticker per line.
+# Edit this file on GitHub and the stock appears on your site within ~30 minutes.
+# Lines starting with # are ignored.
+SNDK
